@@ -16,6 +16,37 @@ from litellm.types.router import Deployment
 
 _FORM_CONTENT_TYPES: Final[frozenset[str]] = frozenset({"application/x-www-form-urlencoded", "multipart/form-data"})
 
+_HIGH_SURROGATE_RE: Final[re.Pattern[str]] = re.compile(r"[\ud800-\udbff]")
+_LOW_SURROGATE_RE: Final[re.Pattern[str]] = re.compile(r"[\udc00-\udfff]")
+_SURROGATE_PAIR_RE: Final[re.Pattern[str]] = re.compile(r"([\ud800-\udbff])([\udc00-\udfff])")
+_LONE_SURROGATE_RE: Final[re.Pattern[str]] = re.compile(
+    r"[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]"
+)
+
+
+def _compose_surrogate_pair(match: re.Match[str]) -> str:
+    high, low = match.group(1), match.group(2)
+    return chr(0x10000 + ((ord(high) - 0xD800) << 10) + (ord(low) - 0xDC00))
+
+
+def _sanitize_string_surrogates(value: str) -> str:
+    """Compose surrogate pairs and replace lone surrogates with U+FFFD so the string can be UTF-8 encoded."""
+    if _HIGH_SURROGATE_RE.search(value) or _LOW_SURROGATE_RE.search(value):
+        value = _SURROGATE_PAIR_RE.sub(_compose_surrogate_pair, value)
+        return _LONE_SURROGATE_RE.sub("\ufffd", value)
+    return value
+
+
+def _sanitize_surrogates(obj: Any) -> Any:
+    """Recursively replace lone surrogates in strings, dict keys, and list items."""
+    if isinstance(obj, str):
+        return _sanitize_string_surrogates(obj)
+    if isinstance(obj, dict):
+        return {_sanitize_string_surrogates(key): _sanitize_surrogates(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_surrogates(item) for item in obj]
+    return obj
+
 
 def _normalize_media_type(content_type: str) -> str:
     """Return the bare media type per RFC 7231: strip params, trim, lowercase."""
@@ -110,14 +141,8 @@ async def _read_request_body(request: Request | None) -> dict:
                     # First decode bytes to string if needed
                     body_str = body.decode("utf-8") if isinstance(body, bytes) else body
 
-                    # Replace invalid surrogate pairs
-                    # This regex finds incomplete surrogate pairs
-                    body_str = re.sub(r"[\uD800-\uDBFF](?![\uDC00-\uDFFF])", "", body_str)
-                    # This regex finds low surrogates without high surrogates
-                    body_str = re.sub(r"(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]", "", body_str)
-
                     try:
-                        parsed_body = json.loads(body_str)
+                        parsed_body = _sanitize_surrogates(json.loads(body_str))
                     except json.JSONDecodeError:
                         # If both orjson and json.loads fail, throw a proper error
                         verbose_proxy_logger.error("Invalid JSON payload received: %s", e)
