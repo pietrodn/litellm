@@ -494,6 +494,79 @@ async def test_surrogate_repair_skipped_above_size_limit(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_lone_surrogate_escape_is_sanitized_to_replacement_char():
+    """
+    Regression: a JSON `\\udXXX` lone-surrogate escape is rejected by orjson and
+    salvaged by the json.loads fallback, which materializes a real lone surrogate
+    in the parsed body. A lone surrogate cannot be UTF-8 encoded, so downstream
+    serialization of the body raised UnicodeEncodeError and the request died.
+    The sanitizer must replace it with U+FFFD so the body serializes cleanly.
+    """
+    body = b'{"model":"gpt-4o","messages":[{"role":"user","content":"\\ud83e"}]}'
+    parsed = await _read_request_body(_make_json_request(body))
+    assert parsed["model"] == "gpt-4o"
+    assert parsed["messages"][0]["content"] == "\ufffd"
+    orjson.dumps(parsed)
+
+
+@pytest.mark.asyncio
+async def test_surrogate_pair_escape_is_preserved_as_a_single_character():
+    """
+    A valid surrogate pair escape (`\\ud83e\\udd16`) must come through orjson as the
+    intended character, not be mangled by the sanitizer.
+    """
+    body = b'{"messages":[{"role":"user","content":"\\ud83e\\udd16"}]}'
+    parsed = await _read_request_body(_make_json_request(body))
+    assert parsed["messages"][0]["content"] == "\U0001F916"
+
+
+@pytest.mark.asyncio
+async def test_lone_surrogate_in_dict_key_is_sanitized():
+    """
+    Dict keys hold lone surrogates too, and a surrogate key crashes serialization
+    just like a surrogate value.
+    """
+    body = b'{"\\ud800key": "value"}'
+    parsed = await _read_request_body(_make_json_request(body))
+    assert parsed["\ufffdkey"] == "value"
+    orjson.dumps(parsed)
+
+
+def test_sanitize_surrogates_deep_structure():
+    from litellm.proxy.common_utils.http_parsing_utils import _sanitize_surrogates
+
+    obj = {
+        "\ud800key": [
+            {"nested": "\udc00", "pair": "\ud83e\udd16", "clean": "ok"},
+            ["\udbff", "\udfff", "tail"],
+        ],
+        "int": 5,
+        "none": None,
+        "bool": True,
+    }
+    sanitized = _sanitize_surrogates(obj)
+    assert sanitized == {
+        "\ufffdkey": [
+            {"nested": "\ufffd", "pair": "\U0001F916", "clean": "ok"},
+            ["\ufffd", "\ufffd", "tail"],
+        ],
+        "int": 5,
+        "none": None,
+        "bool": True,
+    }
+    orjson.dumps(sanitized)
+
+
+def test_sanitize_surrogates_passthrough_clean_and_non_string_objects():
+    from litellm.proxy.common_utils.http_parsing_utils import _sanitize_surrogates
+
+    obj = {"a": ["b", 1, None, True, 3.5], "c": {"d": "e"}}
+    assert _sanitize_surrogates(obj) == obj
+    assert _sanitize_surrogates("no surrogates") == "no surrogates"
+    assert _sanitize_surrogates("\ud83e\udd16") == "\U0001F916"
+
+
+@pytest.mark.asyncio
 async def test_get_form_data():
     """
     A repeated `foo[]` key is how the OpenAI SDKs send a list, so every value has to
